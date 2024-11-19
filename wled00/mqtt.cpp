@@ -2,47 +2,94 @@
 
 /*
  * MQTT communication protocol for home automation
+ *
+ * Forked and modified by Wouter Gritter to change the topic structure to a more intuitive one.
+ * <mqttDeviceTopic>/status => 1 or 0
+ * <mqttDeviceTopic>/brightness => 0 - 255
+ * <mqttDeviceTopic>/rgb => R,G,B[,W] where R,G,B,W 0 - 255
+ *
+ * <mqttGroupTopic> is unused.
+ *
+ * This fork of WLED both publishes and subscribes to these topics.
  */
 
 #ifndef WLED_DISABLE_MQTT
 #define MQTT_KEEP_ALIVE_TIME 60    // contact the MQTT broker every 60 seconds
 
-static void parseMQTTBriPayload(char* payload)
+bool ignoreStatusTopic = false;
+bool ignoreBrightnessTopic = false;
+bool ignoreRgbTopic = false;
+
+static void parseMQTTStatusPayload(char* payload)
 {
-  if      (strstr(payload, "ON") || strstr(payload, "on") || strstr(payload, "true")) {bri = briLast; stateUpdated(CALL_MODE_DIRECT_CHANGE);}
-  else if (strstr(payload, "T" ) || strstr(payload, "t" )) {toggleOnOff(); stateUpdated(CALL_MODE_DIRECT_CHANGE);}
-  else {
-    uint8_t in = strtoul(payload, NULL, 10);
-    if (in == 0 && bri > 0) briLast = bri;
-    bri = in;
+  if (ignoreStatusTopic) {
+    ignoreStatusTopic = false;
+    return;
+  }
+
+  if (strcmp(payload, "1") == 0) {
+    bri = briLast > 0 ? briLast : 255; // Turn ON to last brightness or full if uninitialized
+    stateUpdated(CALL_MODE_DIRECT_CHANGE);
+  } else if (strcmp(payload, "0") == 0) {
+    briLast = bri; // Save current brightness
+    bri = 0;       // Turn OFF
     stateUpdated(CALL_MODE_DIRECT_CHANGE);
   }
 }
 
+static void parseMQTTBrightnessPayload(char* payload)
+{
+  if (ignoreBrightnessTopic) {
+    ignoreBrightnessTopic = false;
+    return;
+  }
+
+  uint8_t brightness = strtoul(payload, NULL, 10);
+  if (brightness <= 255) {
+    bri = brightness;
+    stateUpdated(CALL_MODE_DIRECT_CHANGE);
+  }
+}
+
+static void parseMQTTRgbPayload(char* payload)
+{
+  if (ignoreRgbTopic) {
+    ignoreRgbTopic = false;
+    return;
+  }
+
+  int r, g, b, w = -1; // White channel default to -1 (not provided)
+  int fields = sscanf(payload, "%d,%d,%d,%d", &r, &g, &b, &w);
+
+  if (fields >= 3) { // At least R, G, B must be provided
+    col[0] = constrain(r, 0, 255);
+    col[1] = constrain(g, 0, 255);
+    col[2] = constrain(b, 0, 255);
+    if (fields == 4) { // If white channel is provided
+      col[3] = constrain(w, 0, 255);
+    }
+    colorUpdated(CALL_MODE_DIRECT_CHANGE);
+  }
+}
 
 static void onMqttConnect(bool sessionPresent)
 {
   //(re)subscribe to required topics
-  char subuf[38];
+  char topicbuf[MQTT_MAX_TOPIC_LEN + 16];
 
   if (mqttDeviceTopic[0] != 0) {
-    strlcpy(subuf, mqttDeviceTopic, 33);
-    mqtt->subscribe(subuf, 0);
-    strcat_P(subuf, PSTR("/col"));
-    mqtt->subscribe(subuf, 0);
-    strlcpy(subuf, mqttDeviceTopic, 33);
-    strcat_P(subuf, PSTR("/api"));
-    mqtt->subscribe(subuf, 0);
-  }
+    // Subscribe to device-specific topics
+    strlcpy(topicbuf, mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1);
+    strcat_P(topicbuf, PSTR("/status"));
+    mqtt->subscribe(topicbuf, 0);
 
-  if (mqttGroupTopic[0] != 0) {
-    strlcpy(subuf, mqttGroupTopic, 33);
-    mqtt->subscribe(subuf, 0);
-    strcat_P(subuf, PSTR("/col"));
-    mqtt->subscribe(subuf, 0);
-    strlcpy(subuf, mqttGroupTopic, 33);
-    strcat_P(subuf, PSTR("/api"));
-    mqtt->subscribe(subuf, 0);
+    strlcpy(topicbuf, mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1);
+    strcat_P(topicbuf, PSTR("/brightness"));
+    mqtt->subscribe(topicbuf, 0);
+
+    strlcpy(topicbuf, mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1);
+    strcat_P(topicbuf, PSTR("/rgb"));
+    mqtt->subscribe(topicbuf, 0);
   }
 
   UsermodManager::onMqttConnect(sessionPresent);
@@ -50,7 +97,6 @@ static void onMqttConnect(bool sessionPresent)
   DEBUG_PRINTLN(F("MQTT ready"));
   publishMqtt();
 }
-
 
 static void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total) {
   static char *payloadStr;
@@ -98,94 +144,55 @@ static void onMqttMessage(char* topic, char* payload, AsyncMqttClientMessageProp
 
   //Prefix is stripped from the topic at this point
 
-  if (strcmp_P(topic, PSTR("/col")) == 0) {
-    colorFromDecOrHexString(col, payloadStr);
-    colorUpdated(CALL_MODE_DIRECT_CHANGE);
-  } else if (strcmp_P(topic, PSTR("/api")) == 0) {
-    if (requestJSONBufferLock(15)) {
-      if (payloadStr[0] == '{') { //JSON API
-        deserializeJson(*pDoc, payloadStr);
-        deserializeState(pDoc->as<JsonObject>());
-      } else { //HTTP API
-        String apireq = "win"; apireq += '&'; // reduce flash string usage
-        apireq += payloadStr;
-        handleSet(nullptr, apireq);
-      }
-      releaseJSONBufferLock();
-    }
+  if (strcmp_P(topic, PSTR("/status")) == 0) {
+    parseMQTTStatusPayload(payloadStr);
+  } else if (strcmp_P(topic, PSTR("/brightness")) == 0) {
+    parseMQTTBrightnessPayload(payloadStr);
+  } else if (strcmp_P(topic, PSTR("/rgb")) == 0) {
+    parseMQTTRgbPayload(payloadStr);
   } else if (strlen(topic) != 0) {
     // non standard topic, check with usermods
     UsermodManager::onMqttMessage(topic, payloadStr);
   } else {
-    // topmost topic (just wled/MAC)
-    parseMQTTBriPayload(payloadStr);
+    // topmost topic (ignore)
   }
   delete[] payloadStr;
   payloadStr = nullptr;
 }
-
-// Print adapter for flat buffers
-namespace { 
-class bufferPrint : public Print {
-  char* _buf;
-  size_t _size, _offset;
-  public:
-
-  bufferPrint(char* buf, size_t size) : _buf(buf), _size(size), _offset(0) {};
-
-  size_t write(const uint8_t *buffer, size_t size) {
-    size = std::min(size, _size - _offset);
-    memcpy(_buf + _offset, buffer, size);
-    _offset += size;
-    return size;
-  }
-
-  size_t write(uint8_t c) {
-    return this->write(&c, 1);
-  }
-
-  char* data() const { return _buf; }
-  size_t size() const { return _offset; }
-  size_t capacity() const { return _size; }
-};
-}; // anonymous namespace
-
 
 void publishMqtt()
 {
   if (!WLED_MQTT_CONNECTED) return;
   DEBUG_PRINTLN(F("Publish MQTT"));
 
-  #ifndef USERMOD_SMARTNEST
-  char s[10];
-  char subuf[48];
+  char payloadbuf[32];
+  char topicbuf[MQTT_MAX_TOPIC_LEN + 16];
 
-  sprintf_P(s, PSTR("%u"), bri);
-  strlcpy(subuf, mqttDeviceTopic, 33);
-  strcat_P(subuf, PSTR("/g"));
-  mqtt->publish(subuf, 0, retainMqttMsg, s);         // optionally retain message (#2263)
+  // Publish status
+  ignoreStatusTopic = true;
+  strlcpy(topicbuf, mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1);
+  strcat_P(topicbuf, PSTR("/status"));
+  snprintf(payloadbuf, sizeof(payloadbuf), "%d", bri > 0 ? 1 : 0);
+  mqtt->publish(topicbuf, 0, retainMqttMsg, payloadbuf);
 
-  sprintf_P(s, PSTR("#%06X"), (col[3] << 24) | (col[0] << 16) | (col[1] << 8) | (col[2]));
-  strlcpy(subuf, mqttDeviceTopic, 33);
-  strcat_P(subuf, PSTR("/c"));
-  mqtt->publish(subuf, 0, retainMqttMsg, s);         // optionally retain message (#2263)
+  // Publish brightness
+  ignoreBrightnessTopic = true;
+  strlcpy(topicbuf, mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1);
+  strcat_P(topicbuf, PSTR("/brightness"));
+  snprintf(payloadbuf, sizeof(payloadbuf), "%u", bri);
+  mqtt->publish(topicbuf, 0, retainMqttMsg, payloadbuf);
 
-  strlcpy(subuf, mqttDeviceTopic, 33);
-  strcat_P(subuf, PSTR("/status"));
-  mqtt->publish(subuf, 0, true, "online");          // retain message for a LWT
-
-  // TODO: use a DynamicBufferList.  Requires a list-read-capable MQTT client API.
-  DynamicBuffer buf(1024);
-  bufferPrint pbuf(buf.data(), buf.size());
-  XML_response(pbuf);
-  strlcpy(subuf, mqttDeviceTopic, 33);
-  strcat_P(subuf, PSTR("/v"));
-  mqtt->publish(subuf, 0, retainMqttMsg, buf.data(), pbuf.size());   // optionally retain message (#2263)
-  #endif
+  // Publish RGB(W)
+  ignoreRgbTopic = true;
+  strlcpy(topicbuf, mqttDeviceTopic, MQTT_MAX_TOPIC_LEN + 1);
+  strcat_P(topicbuf, PSTR("/rgb"));
+  if (col[3] > 0) { // White channel is present and non-zero
+    snprintf(payloadbuf, sizeof(payloadbuf), "%d,%d,%d,%d", col[0], col[1], col[2], col[3]);
+  } else { // No white channel
+    snprintf(payloadbuf, sizeof(payloadbuf), "%d,%d,%d", col[0], col[1], col[2]);
+  }
+  mqtt->publish(topicbuf, 0, retainMqttMsg, payloadbuf);
 }
-
-
-//HA autodiscovery was removed in favor of the native integration in HA v0.102.0
 
 bool initMqtt()
 {
@@ -210,11 +217,6 @@ bool initMqtt()
   mqtt->setClientId(mqttClientID);
   if (mqttUser[0] && mqttPass[0]) mqtt->setCredentials(mqttUser, mqttPass);
 
-  #ifndef USERMOD_SMARTNEST
-  strlcpy(mqttStatusTopic, mqttDeviceTopic, 33);
-  strcat_P(mqttStatusTopic, PSTR("/status"));
-  mqtt->setWill(mqttStatusTopic, 0, true, "offline"); // LWT message
-  #endif
   mqtt->setKeepAlive(MQTT_KEEP_ALIVE_TIME);
   mqtt->connect();
   return true;
