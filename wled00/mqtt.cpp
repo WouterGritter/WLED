@@ -16,6 +16,10 @@
 #ifndef WLED_DISABLE_MQTT
 #define MQTT_KEEP_ALIVE_TIME 60    // contact the MQTT broker every 60 seconds
 
+#if MQTT_MAX_TOPIC_LEN > 32
+#warning "MQTT topics length > 32 is not recommended for compatibility with usermods!"
+#endif
+
 bool ignoreStatusTopic = false;
 bool ignoreBrightnessTopic = false;
 bool ignoreRgbTopic = false;
